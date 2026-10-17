@@ -1,0 +1,504 @@
+import { expect, test, type Page } from '@playwright/test'
+import { createServer, type Server } from 'node:http'
+import { openSiteEditor } from './helpers/editor'
+
+const OFFLINE_OLLAMA_URL = 'http://127.0.0.1:1'
+
+// Credentials and their auto-seeded defaults are global state. Later specs
+// (CONTENT-007's no-provider guidance, capability empty-state checks) assume
+// a clean slate, so every test in this file clears what it created. Defaults
+// hold a restrictive FK to credentials, so they clear first.
+test.afterEach(async ({ page }) => {
+  if (!page.url().startsWith('http')) return
+  await page.evaluate(async () => {
+    for (const scope of ['site', 'content', 'data', 'plugin']) {
+      await fetch(`/admin/api/ai/defaults/${scope}`, { method: 'DELETE' }).catch(() => null)
+    }
+    const res = await fetch('/admin/api/ai/credentials')
+    if (!res.ok) return
+    const body: unknown = await res.json()
+    const credentials =
+      body && typeof body === 'object' && 'credentials' in body && Array.isArray(body.credentials)
+        ? body.credentials as Array<{ id?: unknown }>
+        : []
+    for (const credential of credentials) {
+      if (typeof credential.id !== 'string') continue
+      await fetch(`/admin/api/ai/credentials/${credential.id}`, { method: 'DELETE' }).catch(() => null)
+    }
+  })
+})
+
+async function addOllamaCredential(
+  page: Page,
+  label: string,
+  baseUrl = OFFLINE_OLLAMA_URL,
+) {
+  // The Providers section lists provider entries under "Add provider";
+  // selecting one opens the connect panel with the credential form. The
+  // entry's accessible name is label plus short label ("Ollama Local models").
+  await page.getByRole('button', { name: /^Ollama\b/ }).click()
+  await expect(page.getByRole('heading', { name: 'Connect Ollama' })).toBeVisible()
+
+  await page.getByLabel('Display label').fill(label)
+  await page.getByLabel('Base URL').fill(baseUrl)
+  await page.getByRole('button', { name: 'Connect Ollama' }).click()
+
+  // Success lands the new credential in the browser sidebar list.
+  await expect(
+    page.getByRole('button', { name: new RegExp(escapeRegExp(label)) }),
+  ).toBeVisible({ timeout: 20_000 })
+}
+
+async function addOfflineOllamaCredential(page: Page, label: string) {
+  await addOllamaCredential(page, label)
+}
+
+async function removeCredential(page: Page, label: string) {
+  await page.getByRole('button', { name: new RegExp(escapeRegExp(label)) }).click()
+  await page.getByRole('button', { name: 'Remove credential' }).click()
+  const confirm = page.getByRole('dialog', { name: 'Remove credential?' })
+  await confirm.getByRole('button', { name: 'Remove credential' }).click()
+  await expect(confirm).toBeHidden()
+}
+
+interface FakeOllamaToolCall {
+  id: string
+  name: string
+  input: Record<string, unknown>
+}
+
+async function startFakeOllamaServer(
+  responseText = 'E2E audit reply.',
+  toolCall?: FakeOllamaToolCall,
+): Promise<{
+  baseUrl: string
+  requests: { tags: number; chats: number; chatBodies: string[] }
+  close: () => Promise<void>
+}> {
+  const requests = { tags: 0, chats: 0, chatBodies: [] as string[] }
+  const server = createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/api/tags') {
+      requests.tags += 1
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ models: [{ name: 'e2e-model' }] }))
+      return
+    }
+
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks: Buffer[] = []
+      req.on('data', (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      })
+      req.on('end', () => {
+        requests.chats += 1
+        requests.chatBodies.push(Buffer.concat(chunks).toString('utf8'))
+
+        res.writeHead(200, {
+          'cache-control': 'no-cache',
+          'content-type': 'text/event-stream',
+        })
+
+        if (toolCall && requests.chats === 1) {
+          res.write(`data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: toolCall.id,
+                      type: 'function',
+                      function: {
+                        name: toolCall.name,
+                        arguments: JSON.stringify(toolCall.input),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`)
+          res.write(`data: ${JSON.stringify({
+            choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+            usage: { prompt_tokens: 20, completion_tokens: 5 },
+          })}\n\n`)
+          res.end('data: [DONE]\n\n')
+          return
+        }
+
+        res.write(`data: ${JSON.stringify({
+          choices: [{ delta: { content: responseText }, finish_reason: null }],
+        })}\n\n`)
+        res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":123,"completion_tokens":45}}\n\n')
+        res.end('data: [DONE]\n\n')
+      })
+      return
+    }
+
+    res.writeHead(404, { 'content-type': 'text/plain' })
+    res.end('not found')
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    await closeServer(server)
+    throw new Error('Fake Ollama server did not bind to a TCP port.')
+  }
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => closeServer(server),
+  }
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => {
+      if (err) reject(err)
+      else resolve()
+    })
+  })
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * AI-001 — manage provider credentials without depending on external provider
+ * availability. The stable browser contract is that an operator can create an
+ * Ollama base-URL credential, see the safe credential projection, and delete it.
+ */
+test.describe('AI settings', () => {
+  test('creates and deletes an Ollama provider credential (AI-001)', async ({
+    page,
+  }) => {
+    const suffix = Date.now().toString(36)
+    const label = `E2E Ollama ${suffix}`
+
+    await page.goto('/admin/ai')
+    await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+    await expect(page.getByTestId('ai-nav-providers')).toHaveAttribute(
+      'aria-current',
+      'page',
+    )
+
+    await test.step('create an Ollama base URL credential', async () => {
+      await addOfflineOllamaCredential(page, label)
+    })
+
+    // The new credential opens in the detail pane: provider identity,
+    // endpoint row, and the test/remove affordances.
+    await page.getByRole('button', { name: new RegExp(escapeRegExp(label)) }).click()
+    await expect(page.getByText('Endpoint', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Test connection' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Remove credential' })).toBeVisible()
+
+    await test.step('delete the created credential', async () => {
+      await page.getByRole('button', { name: 'Remove credential' }).click()
+      const confirm = page.getByRole('dialog', { name: 'Remove credential?' })
+      await confirm.getByRole('button', { name: 'Remove credential' }).click()
+      await expect(confirm).toBeHidden()
+      await expect(page.getByText(label)).toHaveCount(0)
+    })
+  })
+
+  test('sets and reloads a data-scope default model (AI-002)', async ({
+    page,
+  }) => {
+    const suffix = Date.now().toString(36)
+    const label = `E2E Defaults Ollama ${suffix}`
+
+    await page.goto('/admin/ai')
+    await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+
+    await test.step('create a credential for the defaults picker', async () => {
+      await addOfflineOllamaCredential(page, label)
+      await expect(page.getByRole('heading', { name: label })).toBeVisible({ timeout: 20_000 })
+    })
+
+    await test.step('choose and save a Data default model', async () => {
+      await page.getByTestId('ai-nav-defaults').click()
+      await expect(page.getByRole('heading', { name: 'Defaults', exact: true })).toBeVisible()
+
+      // Scopes list in the browser sidebar; the detail pane holds the picker.
+      await page.getByRole('button', { name: /^Data\b/ }).click()
+      const dataModelButton = page.getByRole('button', { name: 'Model for Data' })
+      await dataModelButton.click()
+      await expect(page.getByRole('menuitemradio', { name: 'Llama 4' })).toBeVisible({
+        timeout: 20_000,
+      })
+      await page.getByRole('menuitemradio', { name: 'Llama 4' }).click()
+
+      await expect(dataModelButton).toContainText(`${label} · Llama 4`)
+      await page.getByRole('button', { name: 'Save default' }).click()
+      await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible()
+    })
+
+    await test.step('reload and verify the saved default resolves', async () => {
+      await page.reload()
+      await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+      await page.getByTestId('ai-nav-defaults').click()
+      await page.getByRole('button', { name: /^Data\b/ }).click()
+      await expect(page.getByRole('button', { name: 'Model for Data' })).toContainText(
+        `${label} · Llama 4`,
+        { timeout: 20_000 },
+      )
+    })
+
+    await test.step('clear the default and delete the credential', async () => {
+      await page.getByRole('button', { name: 'Clear', exact: true }).click()
+      await expect(page.getByRole('status').filter({ hasText: 'Cleared' })).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Model for Data' })).not.toContainText(label)
+
+      await page.getByTestId('ai-nav-providers').click()
+      await removeCredential(page, label)
+      await expect(page.getByText(label)).toHaveCount(0)
+    })
+  })
+
+  test('streams a site chat and renders audit usage rollups (AI-004, AI-006)', async ({
+    page,
+  }) => {
+    const fakeOllama = await startFakeOllamaServer()
+    const suffix = Date.now().toString(36)
+    const label = `E2E Live Ollama ${suffix}`
+
+    try {
+      await test.step('create a live local credential for chat', async () => {
+        await page.goto('/admin/ai')
+        await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+        await addOllamaCredential(page, label, fakeOllama.baseUrl)
+        await expect(page.getByRole('heading', { name: label })).toBeVisible({ timeout: 20_000 })
+        await expect.poll(() => fakeOllama.requests.tags).toBeGreaterThan(0)
+      })
+
+      await test.step('send a site assistant message through the fake provider', async () => {
+        await openSiteEditor(page)
+        await page.getByRole('button', { name: 'Open AI assistant panel' }).click()
+        const assistantPanel = page.getByRole('complementary', { name: 'AI Assistant' })
+        await expect(assistantPanel).toBeVisible()
+
+        const composer = assistantPanel.getByLabel('Message to AI assistant')
+        await expect(composer).toBeEnabled({ timeout: 20_000 })
+        await composer.fill('Summarize the current page for the audit test.')
+        await assistantPanel.getByRole('button', { name: 'Send' }).click()
+
+        await expect(assistantPanel.getByText('E2E audit reply.')).toBeVisible({
+          timeout: 20_000,
+        })
+        await expect.poll(() => fakeOllama.requests.chats).toBe(1)
+      })
+
+      await test.step('verify the Audit tab shows the persisted usage', async () => {
+        await page.goto('/admin/ai')
+        await page.getByTestId('ai-nav-audit').click()
+        await expect(page.getByRole('heading', { name: 'Usage audit' })).toBeVisible()
+        await expect(page.getByText('e2e-model')).toBeVisible({ timeout: 20_000 })
+        await expect(page.getByRole('heading', { name: 'By surface' })).toBeVisible()
+        await expect(page.getByRole('cell', { name: 'site' })).toBeVisible()
+        await expect(page.getByRole('cell', { name: '123' }).first()).toBeVisible()
+        await expect(page.getByRole('cell', { name: '45' }).first()).toBeVisible()
+        await expect(page.getByRole('heading', { name: 'Daily spend' })).toBeVisible()
+      })
+
+      await test.step('clear seeded defaults and delete the credential', async () => {
+        await page.evaluate(async () => {
+          const conversationsRes = await fetch('/admin/api/ai/conversations?scope=site')
+          if (!conversationsRes.ok) {
+            throw new Error(`Failed to list site conversations: ${conversationsRes.status}`)
+          }
+          const conversationsBody = await conversationsRes.json()
+          if (!Array.isArray(conversationsBody.conversations)) {
+            throw new Error('Conversation list response did not include an array.')
+          }
+          for (const conversation of conversationsBody.conversations) {
+            if (typeof conversation?.id !== 'string') {
+              throw new Error('Conversation list response included an invalid id.')
+            }
+            const res = await fetch(`/admin/api/ai/conversations/${conversation.id}`, {
+              method: 'DELETE',
+            })
+            if (!res.ok) throw new Error(`Failed to delete conversation ${conversation.id}: ${res.status}`)
+          }
+          for (const scope of ['site', 'content', 'data', 'plugin']) {
+            const res = await fetch(`/admin/api/ai/defaults/${scope}`, { method: 'DELETE' })
+            if (!res.ok) throw new Error(`Failed to clear ${scope} default: ${res.status}`)
+          }
+        })
+        await page.getByTestId('ai-nav-providers').click()
+        await removeCredential(page, label)
+        await expect(page.getByText(label)).toHaveCount(0)
+      })
+    } finally {
+      await fakeOllama.close()
+    }
+  })
+
+  test('returns a browser tool result to the model loop (AI-005)', async ({
+    page,
+  }) => {
+    const fakeOllama = await startFakeOllamaServer('E2E bridge reply.', {
+      id: 'call_site_read_document',
+      name: 'site_read_document',
+      input: {},
+    })
+    const suffix = Date.now().toString(36)
+    const label = `E2E Bridge Ollama ${suffix}`
+
+    try {
+      await test.step('create a live local credential for the tool loop', async () => {
+        await page.goto('/admin/ai')
+        await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+        await addOllamaCredential(page, label, fakeOllama.baseUrl)
+        await expect(page.getByRole('heading', { name: label })).toBeVisible({ timeout: 20_000 })
+        await expect.poll(() => fakeOllama.requests.tags).toBeGreaterThan(0)
+      })
+
+      await test.step('send a prompt that triggers a browser-backed read tool', async () => {
+        await openSiteEditor(page)
+        await page.getByRole('button', { name: 'Open AI assistant panel' }).click()
+        const assistantPanel = page.getByRole('complementary', { name: 'AI Assistant' })
+        await expect(assistantPanel).toBeVisible()
+
+        const composer = assistantPanel.getByLabel('Message to AI assistant')
+        await expect(composer).toBeEnabled({ timeout: 20_000 })
+        await composer.fill('Read the current document, then summarize it.')
+        await assistantPanel.getByRole('button', { name: 'Send' }).click()
+
+        await expect(
+          assistantPanel.getByRole('status', { name: 'Completed Reading document' }),
+        ).toBeVisible({ timeout: 20_000 })
+        await expect(assistantPanel.getByText('E2E bridge reply.')).toBeVisible({
+          timeout: 20_000,
+        })
+      })
+
+      await test.step('verify the provider received the browser tool result turn', async () => {
+        await expect.poll(() => fakeOllama.requests.chats).toBe(2)
+        const firstBody = fakeOllama.requests.chatBodies[0] ?? ''
+        const secondBody = fakeOllama.requests.chatBodies[1] ?? ''
+        expect(firstBody).toContain('"tools"')
+        expect(firstBody).toContain('"site_read_document"')
+        expect(secondBody).toContain('"role":"tool"')
+        expect(secondBody).toContain('"tool_call_id":"call_site_read_document"')
+      })
+
+      await test.step('clear seeded conversations/defaults and delete the credential', async () => {
+        await page.evaluate(async () => {
+          const conversationsRes = await fetch('/admin/api/ai/conversations?scope=site')
+          if (!conversationsRes.ok) {
+            throw new Error(`Failed to list site conversations: ${conversationsRes.status}`)
+          }
+          const conversationsBody = await conversationsRes.json()
+          if (!Array.isArray(conversationsBody.conversations)) {
+            throw new Error('Conversation list response did not include an array.')
+          }
+          for (const conversation of conversationsBody.conversations) {
+            if (typeof conversation?.id !== 'string') {
+              throw new Error('Conversation list response included an invalid id.')
+            }
+            const res = await fetch(`/admin/api/ai/conversations/${conversation.id}`, {
+              method: 'DELETE',
+            })
+            if (!res.ok) throw new Error(`Failed to delete conversation ${conversation.id}: ${res.status}`)
+          }
+          for (const scope of ['site', 'content', 'data', 'plugin']) {
+            const res = await fetch(`/admin/api/ai/defaults/${scope}`, { method: 'DELETE' })
+            if (!res.ok) throw new Error(`Failed to clear ${scope} default: ${res.status}`)
+          }
+        })
+        await page.goto('/admin/ai')
+        await removeCredential(page, label)
+        await expect(page.getByText(label)).toHaveCount(0)
+      })
+    } finally {
+      await fakeOllama.close()
+    }
+  })
+
+  test('loads and deletes a saved site chat from conversation history (AI-003)', async ({
+    page,
+  }) => {
+    const fakeOllama = await startFakeOllamaServer('E2E conversation reply.')
+    const suffix = Date.now().toString(36)
+    const label = `E2E History Ollama ${suffix}`
+    const prompt = 'Summarize the current page for conversation history.'
+
+    try {
+      await test.step('create a live local credential for the conversation', async () => {
+        await page.goto('/admin/ai')
+        await expect(page.getByRole('heading', { name: 'AI', exact: true })).toBeVisible()
+        await addOllamaCredential(page, label, fakeOllama.baseUrl)
+        await expect(page.getByRole('heading', { name: label })).toBeVisible({ timeout: 20_000 })
+        await expect.poll(() => fakeOllama.requests.tags).toBeGreaterThan(0)
+      })
+
+      await test.step('create a persisted site conversation', async () => {
+        await openSiteEditor(page)
+        await page.getByRole('button', { name: 'Open AI assistant panel' }).click()
+        const assistantPanel = page.getByRole('complementary', { name: 'AI Assistant' })
+        await expect(assistantPanel).toBeVisible()
+
+        const composer = assistantPanel.getByLabel('Message to AI assistant')
+        await expect(composer).toBeEnabled({ timeout: 20_000 })
+        await composer.fill(prompt)
+        await assistantPanel.getByRole('button', { name: 'Send' }).click()
+
+        await expect(assistantPanel.getByText(prompt).first()).toBeVisible()
+        await expect(assistantPanel.getByText('E2E conversation reply.')).toBeVisible({
+          timeout: 20_000,
+        })
+        await expect.poll(() => fakeOllama.requests.chats).toBe(1)
+      })
+
+      await test.step('start a fresh chat and reload the saved one from history', async () => {
+        const assistantPanel = page.getByRole('complementary', { name: 'AI Assistant' })
+        await assistantPanel.getByRole('button', { name: 'New chat' }).click()
+        await expect(assistantPanel.getByText('E2E conversation reply.')).toHaveCount(0)
+
+        await assistantPanel.getByRole('button', { name: 'Conversation history' }).click()
+        const menu = page.getByRole('menu', { name: 'Conversation history' })
+        const savedChat = menu
+          .getByRole('menuitemradio')
+          .filter({ hasText: prompt })
+          .first()
+        await expect(savedChat).toBeVisible()
+        await savedChat.click()
+
+        await expect(assistantPanel.getByText(prompt).first()).toBeVisible()
+        await expect(assistantPanel.getByText('E2E conversation reply.')).toBeVisible()
+      })
+
+      await test.step('delete the active conversation from history', async () => {
+        const assistantPanel = page.getByRole('complementary', { name: 'AI Assistant' })
+        await assistantPanel.getByRole('button', { name: 'Conversation history' }).click()
+        const menu = page.getByRole('menu', { name: 'Conversation history' })
+        await menu.getByRole('button', { name: `Delete chat "${prompt}"` }).click()
+        await expect(menu.getByText('No chats yet.')).toBeVisible()
+        await expect(assistantPanel.getByText('E2E conversation reply.')).toHaveCount(0)
+      })
+
+      await test.step('clear seeded defaults and delete the credential', async () => {
+        await page.evaluate(async () => {
+          for (const scope of ['site', 'content', 'data', 'plugin']) {
+            const res = await fetch(`/admin/api/ai/defaults/${scope}`, { method: 'DELETE' })
+            if (!res.ok) throw new Error(`Failed to clear ${scope} default: ${res.status}`)
+          }
+        })
+        await page.goto('/admin/ai')
+        await removeCredential(page, label)
+        await expect(page.getByText(label)).toHaveCount(0)
+      })
+    } finally {
+      await fakeOllama.close()
+    }
+  })
+})

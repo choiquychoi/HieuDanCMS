@@ -1,0 +1,444 @@
+# Database Dialects
+
+How the CMS runs the same repository code against both Postgres and SQLite, what the rules are, and where the boundaries sit.
+
+The CMS supports **Postgres** (production, multi-author teams, horizontal scale) and **SQLite** (single-VPS self-host, smallest ops footprint). They're selected by `DATABASE_URL` — same image, same code, same migrations IDs. Four rules keep this working.
+
+---
+
+## TL;DR
+
+- **One `DbClient` interface** (`server/db/client.ts`). Two adapters: `postgres.ts` (via `Bun.sql`) and `sqlite.ts` (via `bun:sqlite`).
+- **Repositories are dialect-naive.** They use ANSI-standard SQL only. The five Postgres-isms are banned. Gated by `db-postgres-isms.test.ts`.
+- **JSON columns end in `_json`.** Adapters hydrate string-valued JSON on read; SQLite also stringifies objects on write. Gated by `db-json-column-naming.test.ts`.
+- **Timestamps are bound from JS as ISO 8601.** Repositories write `${nowIso()}`, never SQL `current_timestamp`, so every timestamp column holds one shape on both dialects. Migration 030 rewrote the rows stamped before that rule, and the SQLite adapter still normalises the three legacy DDL defaults on read. Gated by `db-timestamp-writes.test.ts`.
+- **Migrations are split per dialect.** `migrations-pg.ts` and `migrations-sqlite.ts` carry identical migration IDs in the same order. Parity gated by `migration-parity.test.ts`.
+- **Adding a migration** means editing both files. **Adding a JSON column** means naming it `<something>_json`.
+
+---
+
+## The four rules
+
+### Rule 1 — Repositories are dialect-naive
+
+Files under `server/` that import `DbClient` use **only ANSI-standard SQL** that works on both engines. Five specific Postgres-isms are banned:
+
+| Forbidden                          | Reason                                                 | Use instead                                    |
+|------------------------------------|--------------------------------------------------------|------------------------------------------------|
+| `now()` or `current_timestamp` in DML | SQLite has no `now()`, and its `current_timestamp` writes a second timestamp shape (`YYYY-MM-DD HH:MM:SS`) | Bind `${nowIso()}` from `@core/utils/isoDate` (Rule 4) |
+| `::int` (PG cast syntax)           | SQLite doesn't recognize `::`                          | `cast(x as integer)` (rarely needed — Bun's drivers infer types) |
+| `::jsonb`                          | SQLite has no JSONB                                    | Use `_json` columns; both adapters handle the conversion |
+| `any($N::...)`                     | PG-specific array binding                              | Compose an `in (?, ?, ?)` list in JS           |
+| `distinct on`                      | PG-specific                                            | Window-function subquery (`row_number() over (...)`) |
+
+Timestamps are never stamped with `current_timestamp` either, not even for columns only the server compares: bind `nowIso()` (`@core/utils/isoDate`) so every timestamp column holds one shape. Rule 4 has the reasons and the gate.
+
+Gated by `src/__tests__/architecture/db-postgres-isms.test.ts` — scans every file under `server/` that imports `DbClient` and rejects any of the patterns above.
+
+The two migration files (`migrations-pg.ts`, `migrations-sqlite.ts`) are explicitly allowlisted because that's where dialect-specific DDL lives by design.
+
+### Rule 2 — JSON columns end in `_json`
+
+Every column intended to store JSON has a name ending in `_json`. This is a hard convention, not a suggestion.
+
+The adapters exploit it:
+
+- **On read** — any column whose name ends in `_json` and whose value is a non-empty string is auto-`JSON.parse`d. Repositories receive a `Record<string, unknown>`, not a string. Postgres `jsonb` values already arrive parsed; this read normalizer covers `_json` columns backed by text.
+- **On write** — the SQLite adapter auto-`JSON.stringify`s any plain object or array passed via tagged-template interpolation. Postgres relies on `Bun.sql` parameter binding and native `jsonb` handling where the backing column is `jsonb`.
+
+Result: repository code is identical across dialects:
+
+```ts
+await db`update site set settings_json = ${settingsObject} where id = ${id}`
+//                                       ▲
+//                       object → JSONB on PG, object → TEXT on SQLite (auto-stringified)
+
+const { rows } = await db<SiteRow>`select id, settings_json from site`
+// rows[0].settings_json is `Record<string, unknown>` in both dialects
+```
+
+Gated by `src/__tests__/architecture/db-json-column-naming.test.ts`:
+
+1. Every `jsonb`-typed column in `migrations-pg.ts` has a name ending in `_json`.
+2. Every such column appears in `migrations-sqlite.ts` declared as `text`.
+
+### Rule 3 — Migrations are split per dialect with identical IDs
+
+`server/db/migrations-pg.ts` and `server/db/migrations-sqlite.ts` each export a `Migration[]`:
+
+```ts
+type Migration = {
+  id:    string       // e.g. '0042-add-media-folders'
+  label: string
+  sql:   string       // dialect-specific DDL
+}
+```
+
+The two arrays must have **identical IDs in the same order**. Each migration has the same **semantic effect** on both engines — just expressed in each dialect's DDL.
+
+| Postgres                 | SQLite              | Used for                                |
+|--------------------------|---------------------|-----------------------------------------|
+| `jsonb`                  | `text`              | JSON payloads                           |
+| `timestamptz`            | `text`              | Timestamps, bound from JS as ISO 8601 — Rule 4 |
+| `bytea`                  | `blob`              | Binary blobs                            |
+| `bigint`                 | `integer`           | Large integers — **reads back as a `string` on Postgres**, see below |
+| `boolean`                | `integer`           | Booleans (`0` / `1` in SQLite)          |
+| `distinct on (...)`      | `row_number() over (...)` subquery | "Latest per group" queries |
+
+The parity gate (`src/__tests__/architecture/migration-parity.test.ts`) compares the two arrays element-by-element and fails the build if IDs drift.
+
+### Rule 4 — Timestamps are bound from JS as ISO 8601
+
+Repositories never stamp a row with SQL `current_timestamp`. They bind an ISO 8601 string from `nowIso()` (`@core/utils/isoDate`), hoisted once per write so every column in the statement carries the same instant:
+
+```ts
+import { nowIso } from '@core/utils/isoDate'
+
+const now = nowIso()
+await db`update data_rows set deleted_at = ${now}, updated_at = ${now} where id = ${rowId}`
+```
+
+Why: on SQLite `current_timestamp` writes `YYYY-MM-DD HH:MM:SS` (UTC, no `T`, no `Z`) while JS-bound values and the schema's `strftime` defaults write `2026-09-11T18:00:00.000Z`. Two shapes in one column break it three ways: V8 parses the space form as **local** time (a row updated a second ago read "2h ago" on a UTC+2 server), the space form sorts before the `T` form so `order by updated_at desc` misorders same-day rows, and a bound ISO cutoff such as `published_at >= ${sinceIso}` skips the whole boundary day. Postgres never had the problem: `timestamptz` arrives as a `Date`.
+
+Two safety nets cover what the rule cannot reach:
+
+- **Migration `030_iso_timestamps`** rewrote every `*_at` text value already stored in the space form (`ISO_TIMESTAMP_COLUMNS_030` in `migrations-sqlite.ts` lists the columns; `src/__tests__/db/iso-timestamp-migration.test.ts` checks the list against the live schema). Postgres ships it as a no-op.
+- **The SQLite adapter normalises on read.** `collab_documents`, `plugin_media_sources`, and `schema_migrations` predate the ISO `strftime` default and still declare `default current_timestamp`; their inserts bind the columns explicitly, and `normalizeSqliteRow` rewrites any `*_at` value that still arrives in the space form. That is why a DDL `default current_timestamp` may only sit on a `*_at` column.
+
+Gated by `src/__tests__/architecture/db-timestamp-writes.test.ts` — scans every `.ts` file under `server/` and rejects `col = current_timestamp`, positional `values (…, current_timestamp)`, and any `default current_timestamp` on a column not ending in `_at`. Read contract: `src/__tests__/db/sqlite-timestamp-normalization.test.ts`, which pins the process to `Europe/Prague`. Boundary-day regression: `src/__tests__/server/publishedSinceBoundary.test.ts`.
+
+---
+
+## The adapter interface
+
+`server/db/client.ts`:
+
+```ts
+export type Dialect = 'postgres' | 'sqlite'
+
+export interface DbResult<Row> {
+  rows: Row[]
+  rowCount: number
+}
+
+export interface DbClient {
+  <Row = Record<string, unknown>>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<DbResult<Row>>
+
+  unsafe<Row>(sql: string, params?: unknown[]): Promise<DbResult<Row>>
+  transaction<T>(fn: (tx: DbClient) => Promise<T>): Promise<T>
+  close(): Promise<void>
+
+  readonly dialect: Dialect
+}
+```
+
+`close()` releases the backing resource: the SQLite file handle plus its WAL and SHM siblings, or the Postgres connection pool. Queries issued after it reject. The long-lived server client never calls it — it exists for callers with a bounded lifetime, chiefly test teardown, which must release the handle before deleting the database file. Windows refuses to unlink an open file, so relying on garbage collection is not portable. On the transaction-scoped client passed to a `.transaction()` callback it is a no-op, since the enclosing client owns the pool.
+
+`DbClient` is callable as a **tagged template**:
+
+```ts
+const { rows } = await db<{ id: string }>`select id from users where email = ${email}`
+```
+
+Interpolations are bound as parameters — never string-concatenated. The Postgres adapter emits `$1, $2, …`; the SQLite adapter emits `?` placeholders.
+
+### Selecting the adapter
+
+`server/db/index.ts → createDbClient(DATABASE_URL)`:
+
+| `DATABASE_URL`           | Adapter      |
+|--------------------------|--------------|
+| `sqlite:<path>`          | SQLite       |
+| `file:<path>`            | SQLite       |
+| `<path>.db` (bare)       | SQLite       |
+| `postgres://...`         | Postgres     |
+| `postgresql://...`       | Postgres     |
+
+For SQLite, the parent directory of the DB file is created automatically.
+
+### Adapter behaviors at the boundary
+
+**`server/db/sqlite.ts` owns the SQLite-specific boundary work:**
+
+1. `toBindable(value)` converts JS values for SQLite parameter binding:
+   - Plain object / array → `JSON.stringify` (stored as `TEXT`)
+   - `Date` → ISO 8601 string
+   - `Uint8Array` / Buffer → pass through (stored as `BLOB`)
+   - `boolean` → `1` / `0`
+   - `null` / `undefined` → `null`
+   - Everything else → pass through
+2. On read, columns ending in `_json` whose value is a non-empty string are auto-`JSON.parse`d.
+3. On read, columns ending in `_at` whose value is SQLite's `YYYY-MM-DD HH:MM:SS[.SSS]` stamp are rewritten to ISO 8601 UTC. Only the three legacy DDL defaults can still write that shape (Rule 4); both read conversions live in `normalizeSqliteRow`.
+4. Pragmas set at boot: `journal_mode = WAL`, `foreign_keys = ON`, `synchronous = NORMAL`, `busy_timeout = 5000`.
+5. **Transaction serialization.** `bun:sqlite` uses one shared synchronous connection, but a transaction callback can `await` async work while its `BEGIN` is still open. Two concurrent `db.transaction()` calls would cause the second `BEGIN` to throw "cannot start a transaction within a transaction", and the implied `ROLLBACK` would silently abort the first transaction's writes. The adapter prevents this with a promise chain (`txChain`): each `.transaction()` call queues behind the previous one and only issues `BEGIN` after the prior transaction has fully settled. Callers don't need to do anything — it's automatic.
+
+The Postgres adapter relies on `Bun.sql`'s native handling of `jsonb` columns and parameter binding — JS objects sent to `jsonb` columns are stored as JSONB and read back as `Record<string, unknown>` automatically.
+
+**`bigint` columns read back as strings on Postgres.** `Bun.sql` returns `int8` as a JS string so values above `Number.MAX_SAFE_INTEGER` don't lose precision, while SQLite's `integer` affinity hands back a real number. The adapter deliberately does not coerce — that would throw the precision guarantee away for every caller. **A repository reading a `bigint` column therefore types the row field `number | string` and coerces in its mapper:**
+
+```ts
+interface MediaAssetRow {
+  size_bytes: number | string   // `bigint` — Postgres returns int8 as a string
+}
+
+function rowToAsset(row: MediaAssetRow): MediaAsset {
+  return { sizeBytes: Number(row.size_bytes) }
+}
+```
+
+Skipping the coercion is invisible in the default SQLite install and only breaks Postgres deployments, so it will not show up in `bun test` (the harness is in-memory SQLite). Existing examples: `repositories/mediaAssetMapping.ts`, `repositories/mediaMigration.ts`, `ai/conversations/store.ts`, `ai/mcp/oauth/store.ts`, `repositories/syncSequence.ts`. Aggregates need it too — `sum()` over a `bigint` returns `numeric`, which also arrives as a string (`handlers/cms/dashboard/storage.ts`).
+
+**`server/db/postgres.ts`** normalizes returned rows by converting `Date` instances to ISO strings and parsing string-valued `_json` columns. It also resolves `rowCount` from `result.count` (Bun's per-command row count from PostgreSQL's CommandComplete tag) rather than `result.length`. For non-RETURNING writes (UPDATE / DELETE / INSERT), Postgres streams the affected-row count in its CommandComplete tag rather than returning data rows, so `result.length` is always 0 for those statements. `result.count` captures the CommandComplete count, giving `rowCount` the same semantics as the SQLite adapter's `info.changes`. Falls back to `result.length` if the property is absent.
+
+---
+
+## Cookbook
+
+### Adding a new migration
+
+1. **Pick an ID.** Migrations are sorted by ID. Use a zero-padded prefix or a date prefix that sorts: `0042-…`, `20260501-…`.
+2. **Add to `server/db/migrations-pg.ts`:**
+   ```ts
+   {
+     id: '0042-add-subscribers',
+     label: 'Add subscribers table',
+     sql: `
+       create table subscribers (
+         id text primary key,
+         email text not null unique,
+         metadata_json jsonb not null default '{}',
+         created_at timestamptz not null default current_timestamp
+       );
+     `,
+   },
+   ```
+3. **Add to `server/db/migrations-sqlite.ts`** — same ID and label, dialect-translated DDL:
+   ```ts
+   {
+     id: '0042-add-subscribers',
+     label: 'Add subscribers table',
+     sql: `
+       create table subscribers (
+         id text primary key,
+         email text not null unique,
+         metadata_json text not null default '{}',
+         created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       );
+     `,
+   },
+   ```
+   The SQLite default is the ISO `strftime` form, never `current_timestamp` (Rule 4).
+4. **Run `bun test`** — the parity gate and the JSON-naming gate confirm you got it right.
+
+### Dropping a constraint or altering a table in SQLite (table-rebuild dance)
+
+SQLite doesn't support `ALTER TABLE DROP CONSTRAINT` or `ALTER TABLE DROP COLUMN`. To remove or change a constraint, rebuild the table:
+
+**Postgres** (migration SQL):
+```sql
+alter table my_table drop constraint if exists my_constraint_name;
+```
+
+**SQLite** (migration SQL — the table-rebuild dance):
+```sql
+pragma defer_foreign_keys = on;
+
+-- 1. Create the new table with the desired final schema.
+create table my_table__migr042 (
+  id text primary key,
+  -- ... same columns, omitting (or changing) the constraint
+);
+
+-- 2. Copy all rows.
+insert into my_table__migr042 (id, col_a, col_b)
+select id, col_a, col_b from my_table;
+
+-- 3. Swap.
+drop table my_table;
+alter table my_table__migr042 rename to my_table;
+
+-- 4. Re-create indexes that lived on the original table.
+create unique index if not exists my_table_unique_idx on my_table (col_a, col_b);
+```
+
+`pragma defer_foreign_keys = on` is transaction-scoped — it defers FK enforcement to COMMIT so foreign keys that reference `my_table` don't break during the drop+recreate. SQLite re-enables FK enforcement automatically at COMMIT.
+
+**Exception — parents referenced by `ON DELETE RESTRICT`:** RESTRICT actions fire immediately even under `defer_foreign_keys`, so a populated parent table (e.g. `data_tables`, referenced by `data_rows.table_id`) cannot be dropped mid-rebuild — and renaming it away doesn't help, because since SQLite 3.25 a RENAME always rewrites child FK clauses to follow it. For these rebuilds set `disableForeignKeys: true` on the migration: the runner toggles `PRAGMA foreign_keys` off around that migration's transaction (the pragma is a no-op inside one) and verifies `pragma foreign_key_check` before re-enabling enforcement. SQLite-only — never set it on a PG migration.
+
+The rebuilt table produces the same schema as the updated `CREATE TABLE` statement in the original migration, so the migration is safe to run on both existing and fresh installs.
+
+Examples in the codebase: `migrations-sqlite.ts` migration `006_data_rows_scheduled_publish` (drop status CHECK), `012_ai_drop_provider_check` (drop provider_id CHECK), and `017_layouts_system_table` (widen the data_tables kind CHECK — a RESTRICT-referenced parent, so it uses `disableForeignKeys`).
+
+### Adding a new repository
+
+1. Create `server/repositories/<resource>.ts`.
+2. Export typed functions:
+   ```ts
+   export async function listSubscribers(db: DbClient): Promise<SubscriberRow[]> {
+     const { rows } = await db<SubscriberRow>`
+       select id, email, metadata_json, created_at
+       from subscribers
+       order by created_at desc
+     `
+     return rows
+   }
+   ```
+3. Use ANSI SQL only. No `now()`, no `::jsonb`, no `distinct on`. Stamp timestamps with `${nowIso()}`, never `current_timestamp`.
+4. JSON columns end in `_json` — both adapters handle them.
+
+### Using `db.unsafe()` with dialect-aware placeholders
+
+`db.unsafe()` is reserved for queries that splice a shared column-list constant
+into the SQL string (like `USER_JOINED_COLUMNS` in `server/repositories/users.ts`
+or `DATA_ROW_COLUMNS`), where the tagged-template API can't be used because the
+full SELECT list must be a string literal. In those cases use `placeholder()` from
+`server/db/client.ts` for positional parameters so the same SQL works on both
+dialects:
+
+```ts
+import { placeholder, type DbClient } from '../db/client'
+
+const { rows } = await db.unsafe<SubscriberRow>(
+  `select ${SUBSCRIBER_COLUMNS}
+   from subscribers
+   where id = ${placeholder(db.dialect, 1)}
+     and deleted_at is null
+   limit 1`,
+  [subscriberId],
+)
+```
+
+`placeholder(db.dialect, N)` returns `$N` on Postgres and `?` on SQLite. Every
+parameter position must use it — never concatenate the value directly into the
+string. The tagged-template API (`db\`...\``) handles dialect differences
+automatically and is preferred; `db.unsafe()` + `placeholder()` is the fallback
+for column-list splice scenarios only.
+
+### "Latest per group" (the `distinct on` replacement)
+
+Postgres:
+```sql
+select distinct on (page_id) page_id, snapshot_id, created_at
+from snapshots
+order by page_id, created_at desc
+```
+
+ANSI-portable (works on both):
+```sql
+select page_id, snapshot_id, created_at
+from (
+  select page_id, snapshot_id, created_at,
+         row_number() over (partition by page_id order by created_at desc) as rn
+  from snapshots
+) ranked
+where rn = 1
+```
+
+This is the form the repositories use. The dialect-naive rewrite means the repository is portable; the SQLite migration's JSDoc documents the original `distinct on` for context.
+
+### Reading a JSON column
+
+```ts
+const { rows } = await db<{ id: string; settings_json: Record<string, unknown> }>`
+  select id, settings_json from site where id = ${id}
+`
+// rows[0].settings_json is already an object
+```
+
+### Writing a JSON column
+
+```ts
+await db`update site set settings_json = ${{ theme: 'dark', breakpoints: [...] }}
+         where id = ${id}`
+// SQLite: auto-stringified.  Postgres: native JSONB binding.
+```
+
+### Checking how many rows were affected
+
+```ts
+const result = await db`update sessions set revoked = true where user_id = ${userId}`
+if (result.rowCount === 0) {
+  // no session existed — nothing to revoke
+}
+```
+
+`rowCount` equals the number of rows affected by a non-RETURNING write, or the number of rows returned by a SELECT / RETURNING query. Both adapters report the same value — do not use `result.rows.length` as a proxy for affected rows.
+
+### Wrapping multi-row writes in a transaction
+
+```ts
+await db.transaction(async (tx) => {
+  for (const page of pages) {
+    await tx`update pages set cells_json = ${page.cells} where id = ${page.id}`
+  }
+  await tx`insert into audit_log (...) values (...)`
+})
+```
+
+The callback receives a `DbClient` scoped to the transaction. If it throws, the transaction is rolled back.
+
+### Adding a generated column
+
+Both dialects accept a column computed from the same row. SQLite can only ADD a `virtual` generated column; Postgres wants `stored`:
+
+```sql
+-- migrations-sqlite.ts
+alter table data_rows add column logical_id text generated always as (
+  case when branch_id = 'main' then id else substr(id, length(branch_id) + 2) end
+) virtual;
+
+-- migrations-pg.ts
+alter table data_rows add column logical_id text generated always as (
+  case when branch_id = 'main' then id else substr(id, length(branch_id) + 2) end
+) stored;
+```
+
+Inserts must not name the column; reads and `returning` may. Migration 026 uses this for `logical_id` on the three branched tables.
+
+---
+
+## Forbidden patterns
+
+| Pattern                                                | Use instead                                                   |
+|--------------------------------------------------------|---------------------------------------------------------------|
+| `now()` or `current_timestamp` in DML (`server/` files importing `DbClient`) | Bind `${nowIso()}` — see Rule 4                    |
+| `cast(x as int)` via `x::int`                          | Drivers usually infer; use `cast(x as integer)` when needed   |
+| `where col = any($1::text[])`                          | Build an `in (...)` list in JS                                |
+| `select distinct on (col) ...`                         | `row_number() over (partition by ...)` subquery               |
+| `column_name jsonb` without the `_json` suffix         | Rename to `column_name_json`                                  |
+| `updated_at = current_timestamp` (SET or positional INSERT)  | `const now = nowIso()` then `updated_at = ${now}` — SQLite would store a second timestamp shape (`db-timestamp-writes.test.ts`) |
+| `default current_timestamp` on a column not ending in `_at` | Name it `<something>_at`, or better use the ISO `strftime` default — the SQLite adapter normalises the legacy shape by that suffix |
+| Writing a JSON value as `${JSON.stringify(obj)}`       | Pass the object directly — both adapters handle it            |
+| Reading a JSON value as a string and then `JSON.parse`ing | Read it as `Record<string, unknown>` — auto-parsed in SQLite, auto-decoded in PG |
+| Adding a migration to only one dialect's file          | Mirror it to the other — `migration-parity.test.ts` enforces this |
+| Hand-running `db.unsafe(...)` for queryable statements | Use the tagged-template form — `unsafe` is for stored migration blocks |
+| DB-level CHECK constraints that enumerate application domain values (e.g. `check (provider_id in ('anthropic', 'openai'))`) | Put the validation at the application boundary via a TypeBox `Type.Union` / `Type.Literal` — see `server/ai/handlers/credentials.ts`. A DB enum that duplicates the list forces a destructive migration (especially on SQLite) every time a new value is added. |
+
+---
+
+## Related
+
+- [docs/architecture.md](../architecture.md) — system overview
+- [docs/server.md](../server.md) — server-side flow including DB adapters
+- Source-of-truth files:
+  - `server/db/client.ts` — `DbClient` interface
+  - `server/db/index.ts` — adapter selection by URL
+  - `server/db/postgres.ts` — Postgres adapter
+  - `server/db/sqlite.ts` — SQLite adapter (`normalizeSqliteRow`: `_json` parse + `_at` timestamp normalisation; `toBindable`)
+  - `server/db/migrations-pg.ts` — Postgres migrations
+  - `server/db/migrations-sqlite.ts` — SQLite migrations
+  - `server/db/runMigrations.ts` — runs migrations idempotently at boot
+- Gate tests:
+  - `src/__tests__/architecture/db-postgres-isms.test.ts`
+  - `src/__tests__/architecture/db-json-column-naming.test.ts`
+  - `src/__tests__/architecture/db-timestamp-writes.test.ts`
+  - `src/__tests__/architecture/migration-parity.test.ts`
+  - `src/__tests__/architecture/json-extract-egress.test.ts`
+- Regression tests:
+  - `src/__tests__/db/adapter-rowcount.test.ts` — cross-dialect `rowCount` contract (affected rows for non-RETURNING writes, returned rows for SELECT / RETURNING)
+  - `src/__tests__/db/sqlite-timestamp-normalization.test.ts` — `*_at` columns stamped by `current_timestamp` read back as ISO 8601 UTC under a non-UTC `TZ`
+  - `src/__tests__/db/iso-timestamp-migration.test.ts` — migration 030 covers every `*_at` text column and rewrites the space form in place
+  - `src/__tests__/server/publishedSinceBoundary.test.ts` — a row published on the `since` day counts toward the dashboard window
