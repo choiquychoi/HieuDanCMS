@@ -1,0 +1,1 @@
+import{n as e}from"./rolldown-runtime-BYbx6iT9.js";function t(e,t=`Unknown error`){return e instanceof Error&&e.message.trim()?e.message:t}var n=e((()=>{}));export{n,t};

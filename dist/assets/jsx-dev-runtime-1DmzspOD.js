@@ -1,0 +1,1 @@
+import{t as e}from"./react-vendor-BYQisKJP.js";export default e();

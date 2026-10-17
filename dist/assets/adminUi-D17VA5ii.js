@@ -1,0 +1,1 @@
+import{n as e,r as t}from"./adminUi-BQnsB_HW.js";e();export{t as useAdminUi};

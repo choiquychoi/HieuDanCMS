@@ -1,0 +1,1 @@
+import{n as e}from"./rolldown-runtime-BYbx6iT9.js";function t(){a=!0,typeof window<`u`&&window.dispatchEvent(new Event(i))}function n(){return a}function r(){return a?(a=!1,!0):!1}var i,a,o,s=e((()=>{i=`cms-site-reload`,a=!1,o=`cms-site-bundle-imported`}));export{s as a,n as i,i as n,t as o,r,o as t};
